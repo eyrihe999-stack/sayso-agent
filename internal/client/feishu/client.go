@@ -35,6 +35,21 @@ func NewClient(cfg Config) *Client {
 
 const feishuAPIBase = "https://open.feishu.cn/open-apis"
 
+// checkHTTPStatus 读取 body 并检查 HTTP 状态码；非 2xx 时直接返回错误（不解析 JSON），
+// 避免网关/404 返回纯文本（如 "404 page not found"）时出现 "invalid character 'p' after top-level value"。
+// 约定：本包内所有飞书 API 调用必须先通过 checkHTTPStatus 检查状态码，再对 body 做 json.Unmarshal。
+func (c *Client) checkHTTPStatus(resp *http.Response, apiName string) ([]byte, error) {
+	defer resp.Body.Close()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("%s: read body: %w", apiName, err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("%s: http status %d, body: %s", apiName, resp.StatusCode, string(b))
+	}
+	return b, nil
+}
+
 // 鉴权接口响应：https://open.feishu.cn/document/server-docs/authentication-v3/tenant_access_token/internal
 type tenantAccessTokenResp struct {
 	Code              int    `json:"code"`
@@ -60,8 +75,10 @@ func (c *Client) GetTenantAccessToken(ctx context.Context) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := c.checkHTTPStatus(resp, "feishu auth")
+	if err != nil {
+		return "", err
+	}
 	var result tenantAccessTokenResp
 	if err := json.Unmarshal(b, &result); err != nil {
 		return "", fmt.Errorf("feishu auth parse response: %w, body: %s", err, string(b))
@@ -105,8 +122,10 @@ func (c *Client) CreateDoc(ctx context.Context, token, folderToken, title, conte
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := c.checkHTTPStatus(resp, "feishu create doc")
+	if err != nil {
+		return "", err
+	}
 	var result docxCreateDocumentResp
 	if err := json.Unmarshal(b, &result); err != nil {
 		return "", fmt.Errorf("feishu create doc parse response: %w, body: %s", err, string(b))
@@ -116,6 +135,51 @@ func (c *Client) CreateDoc(ctx context.Context, token, folderToken, title, conte
 	}
 	_ = content
 	return result.Data.Document.DocumentID, nil
+}
+
+// 创建文件夹接口响应：https://open.feishu.cn/document/server-docs/docs/drive-v1/folder/create_folder
+// POST /open-apis/drive/v1/folder/create_folder，请求体 name、folder_token；响应 data 含新文件夹 token
+type driveCreateFolderResp struct {
+	Code int    `json:"code"`
+	Msg  string `json:"msg"`
+	Data struct {
+		Token string `json:"token"`
+		URL   string `json:"url"`
+	} `json:"data"`
+}
+
+// CreateFolder 创建云空间文件夹
+// API: POST /open-apis/drive/v1/folder/create_folder
+// 请求体：name（文件夹名称）、folder_token（父文件夹 token，不传则在根目录下创建需按文档确认是否必填）
+func (c *Client) CreateFolder(ctx context.Context, accessToken, parentFolderToken, name string) (string, error) {
+	url := feishuAPIBase + "/drive/v1/files/create_folder"
+	reqBody := map[string]string{
+		"name":         name,
+		"folder_token": parentFolderToken,
+	}
+	data, _ := json.Marshal(reqBody)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	b, err := c.checkHTTPStatus(resp, "feishu create folder")
+	if err != nil {
+		return "", err
+	}
+	var result driveCreateFolderResp
+	if err := json.Unmarshal(b, &result); err != nil {
+		return "", fmt.Errorf("feishu create folder parse response: %w, body: %s", err, string(b))
+	}
+	if result.Code != 0 {
+		return "", fmt.Errorf("feishu create folder: code=%d msg=%s body=%s", result.Code, result.Msg, string(b))
+	}
+	return result.Data.Token, nil
 }
 
 // Collaborator 协作者信息
@@ -159,8 +223,10 @@ func (c *Client) AddCollaborator(ctx context.Context, accessToken, docToken, doc
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := c.checkHTTPStatus(resp, "feishu add collaborator")
+	if err != nil {
+		return err
+	}
 	var result addPermissionMemberResp
 	if err := json.Unmarshal(b, &result); err != nil {
 		return fmt.Errorf("feishu add collaborator parse response: %w, body: %s", err, string(b))
@@ -210,22 +276,10 @@ func (c *Client) SearchUser(ctx context.Context, accessToken, query string) ([]U
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
-
-	// 检查 HTTP 状态码
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("feishu search user: http status %d, body: %s", resp.StatusCode, string(b))
+	b, err := c.checkHTTPStatus(resp, "feishu search user")
+	if err != nil {
+		return nil, err
 	}
-
-	// 检查响应是否为空或非 JSON
-	if len(b) == 0 {
-		return nil, fmt.Errorf("feishu search user: empty response")
-	}
-	if b[0] != '{' {
-		return nil, fmt.Errorf("feishu search user: invalid response (not JSON), body: %.200s", string(b))
-	}
-
 	var result model.GetUserInfoAPIResponse
 	if err := json.Unmarshal(b, &result); err != nil {
 		return nil, fmt.Errorf("feishu search user parse response: %w, body: %.500s", err, string(b))
@@ -298,8 +352,10 @@ func (c *Client) GetRootFolderToken(ctx context.Context, token string) (string, 
 	if err != nil {
 		return "", err
 	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := c.checkHTTPStatus(resp, "feishu get root folder")
+	if err != nil {
+		return "", err
+	}
 	var result rootFolderMetaResp
 	if err := json.Unmarshal(b, &result); err != nil {
 		return "", fmt.Errorf("feishu get root folder parse response: %w, body: %s", err, string(b))
@@ -339,8 +395,10 @@ func (c *Client) ListFolderChildren(ctx context.Context, token, folderToken stri
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := c.checkHTTPStatus(resp, "feishu list folder")
+	if err != nil {
+		return nil, err
+	}
 	var result listFilesResp
 	if err := json.Unmarshal(b, &result); err != nil {
 		return nil, fmt.Errorf("feishu list folder parse response: %w, body: %s", err, string(b))
@@ -421,16 +479,36 @@ type sendMessageResp struct {
 }
 
 // SendIM 发送私聊消息（通过机器人或应用）
+// 若 content 中含 http/https 链接，会以 post 富文本发送，使链接可点击；否则以 text 发送
 func (c *Client) SendIM(ctx context.Context, token, receiveIDType, receiveID, content string) error {
 	url := feishuAPIBase + "/im/v1/messages"
 	params := "?receive_id_type=" + receiveIDType
+	var contentStr string
+	if linkURL := extractFirstURL(content); linkURL != "" {
+		// 使用 post 富文本，链接可点击
+		contentStr = buildPostContentWithLink(content, linkURL)
+		reqBody := map[string]interface{}{
+			"receive_id": receiveID,
+			"msg_type":   "post",
+			"content":    contentStr,
+		}
+		data, _ := json.Marshal(reqBody)
+		return c.sendIMRequest(ctx, token, url+params, receiveID, data)
+	}
+	// text 类型，对 content 做 JSON 转义，避免引号/换行导致发送失败或链接被截断
+	textContent, _ := json.Marshal(map[string]string{"text": content})
 	reqBody := map[string]interface{}{
 		"receive_id": receiveID,
 		"msg_type":   "text",
-		"content":    fmt.Sprintf(`{"text":"%s"}`, content),
+		"content":    string(textContent),
 	}
 	data, _ := json.Marshal(reqBody)
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url+params, bytes.NewReader(data))
+	return c.sendIMRequest(ctx, token, url+params, receiveID, data)
+}
+
+// sendIMRequest 发送飞书消息请求（公共逻辑）
+func (c *Client) sendIMRequest(ctx context.Context, token, fullURL, receiveID string, data []byte) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(data))
 	if err != nil {
 		return err
 	}
@@ -440,8 +518,10 @@ func (c *Client) SendIM(ctx context.Context, token, receiveIDType, receiveID, co
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, err := c.checkHTTPStatus(resp, "feishu send im")
+	if err != nil {
+		return err
+	}
 	var result sendMessageResp
 	if err := json.Unmarshal(b, &result); err != nil {
 		return fmt.Errorf("feishu send im parse response: %w, body: %s", err, string(b))
@@ -450,4 +530,65 @@ func (c *Client) SendIM(ctx context.Context, token, receiveIDType, receiveID, co
 		return fmt.Errorf("feishu send im: code=%d msg=%s body=%s", result.Code, result.Msg, string(b))
 	}
 	return nil
+}
+
+// extractFirstURL 从文本中提取第一个 http(s) URL
+func extractFirstURL(s string) string {
+	const https = "https://"
+	const http = "http://"
+	rest := s
+	for {
+		i1 := bytes.Index([]byte(rest), []byte(https))
+		i2 := bytes.Index([]byte(rest), []byte(http))
+		start := -1
+		if i1 >= 0 && (i2 < 0 || i1 <= i2) {
+			start = i1
+		} else if i2 >= 0 {
+			start = i2
+		}
+		if start < 0 {
+			return ""
+		}
+		idx := start
+		if idx+len(https) <= len(rest) && rest[idx:idx+len(https)] == https {
+			idx += len(https)
+		} else if idx+len(http) <= len(rest) && rest[idx:idx+len(http)] == http {
+			idx += len(http)
+		} else {
+			rest = rest[start+1:]
+			continue
+		}
+		for idx < len(rest) && isURLChar(rest[idx]) {
+			idx++
+		}
+		return rest[start:idx]
+	}
+}
+
+func isURLChar(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z') || (b >= '0' && b <= '9') ||
+		b == '.' || b == '-' || b == '_' || b == '~' || b == ':' || b == '/' || b == '?' || b == '#' || b == '[' || b == ']' || b == '@' || b == '!'
+}
+
+// buildPostContentWithLink 构建飞书 post 富文本 content（zh_cn），一段：正文 + 可点击链接 + 链接后文字
+// 飞书 post 格式：{"zh_cn":{"content":[[{"tag":"text","text":"..."},{"tag":"a","text":"显示文字","href":"url"},{"tag":"text","text":"..."}]]}}
+func buildPostContentWithLink(fullText, linkURL string) string {
+	idx := bytes.Index([]byte(fullText), []byte(linkURL))
+	textBefore := fullText
+	textAfter := ""
+	if idx >= 0 {
+		textBefore = fullText[:idx]
+		if idx+len(linkURL) <= len(fullText) {
+			textAfter = fullText[idx+len(linkURL):]
+		}
+	}
+	paragraph := []interface{}{
+		map[string]string{"tag": "text", "text": textBefore},
+		map[string]string{"tag": "a", "text": linkURL, "href": linkURL},
+		map[string]string{"tag": "text", "text": textAfter},
+	}
+	zhCN := map[string]interface{}{"content": [][]interface{}{paragraph}}
+	root := map[string]interface{}{"zh_cn": zhCN}
+	b, _ := json.Marshal(root)
+	return string(b)
 }

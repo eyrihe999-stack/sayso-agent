@@ -3,25 +3,33 @@ package service
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"strconv"
+	"strings"
 	"time"
 
 	"sayso-agent/internal/model"
+	"sayso-agent/internal/service/executor"
+	servicellm "sayso-agent/internal/service/llm"
 )
 
 // ASRService 编排：接收 ASR 文本 -> 调大模型 -> 执行动作（飞书/Slack 等）
 type ASRService struct {
-	llm      *LLMService
-	executor *Executor
+	llm      *servicellm.Service
+	executor *executor.Executor
 }
 
 // NewASRService 创建 ASR 编排服务
-func NewASRService(llm *LLMService, executor *Executor) *ASRService {
+func NewASRService(llm *servicellm.Service, exec *executor.Executor) *ASRService {
 	return &ASRService{
 		llm:      llm,
-		executor: executor,
+		executor: exec,
 	}
 }
+
+// 占位符：大模型在生成时不知道前序动作结果，用 {{doc_url}} 等占位，执行时用真实值替换
+// 支持: doc_url, doc_id, folder_url, folder_id, last_url, last_note
+var placeholderRE = regexp.MustCompile(`\{\{(\w+)\}\}`)
 
 // Process 处理内部传入的 ASR 文本，完成大模型理解与外部动作执行
 func (s *ASRService) Process(ctx context.Context, req model.ASRRequest) (model.ASRResponse, error) {
@@ -38,9 +46,11 @@ func (s *ASRService) Process(ctx context.Context, req model.ASRRequest) (model.A
 		return resp, err
 	}
 
-	// 2. 逐条执行动作（本服务代表大模型调用外部 API）；传入 req 以便未指定接收人时用 user_id/context 作为默认
+	// 2. 逐条执行动作；用前序动作结果替换 {{doc_url}} 等占位符（大模型不知道真实 URL）
+	placeholders := make(map[string]string)
 	var summaries []model.ActionSummary
 	for _, spec := range llmOut.Actions {
+		spec := applyPlaceholders(spec, placeholders)
 		summary, err := s.executor.Execute(ctx, spec, &req)
 		if err != nil {
 			resp.Message = fmt.Sprintf("执行动作 %s 失败: %v", spec.Type, err)
@@ -48,6 +58,7 @@ func (s *ASRService) Process(ctx context.Context, req model.ASRRequest) (model.A
 			return resp, err
 		}
 		summaries = append(summaries, summary)
+		updatePlaceholders(placeholders, spec.Type, summary)
 	}
 
 	resp.Success = true
@@ -58,4 +69,61 @@ func (s *ASRService) Process(ctx context.Context, req model.ASRRequest) (model.A
 		resp.Message = "处理完成"
 	}
 	return resp, nil
+}
+
+// applyPlaceholders 将 spec 中 Params 里的字符串值中的 {{key}} 替换为 placeholders[key]
+func applyPlaceholders(spec model.ActionSpec, placeholders map[string]string) model.ActionSpec {
+	if len(placeholders) == 0 {
+		return spec
+	}
+	out := spec
+	if spec.Params != nil {
+		out.Params = make(map[string]interface{})
+		for k, v := range spec.Params {
+			if s, ok := v.(string); ok {
+				out.Params[k] = replacePlaceholdersInString(s, placeholders)
+			} else {
+				out.Params[k] = v
+			}
+		}
+	}
+	return out
+}
+
+func replacePlaceholdersInString(s string, placeholders map[string]string) string {
+	return placeholderRE.ReplaceAllStringFunc(s, func(match string) string {
+		key := strings.TrimSuffix(strings.TrimPrefix(match, "{{"), "}}")
+		if v, ok := placeholders[key]; ok {
+			return v
+		}
+		return match
+	})
+}
+
+// updatePlaceholders 根据刚执行完的动作类型与结果，更新占位符供后续动作使用
+func updatePlaceholders(m map[string]string, actionType string, summary model.ActionSummary) {
+	switch actionType {
+	case "feishu_create_doc":
+		if summary.URL != "" {
+			m["doc_url"] = summary.URL
+			m["last_url"] = summary.URL
+		}
+		if summary.ID != "" {
+			m["doc_id"] = summary.ID
+		}
+		if summary.Note != "" {
+			m["last_note"] = summary.Note
+		}
+	case "feishu_create_folder":
+		if summary.URL != "" {
+			m["folder_url"] = summary.URL
+			m["last_url"] = summary.URL
+		}
+		if summary.ID != "" {
+			m["folder_id"] = summary.ID
+		}
+		if summary.Note != "" {
+			m["last_note"] = summary.Note
+		}
+	}
 }

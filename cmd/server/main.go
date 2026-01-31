@@ -13,6 +13,8 @@ import (
 	"sayso-agent/internal/client/slack"
 	"sayso-agent/internal/handler"
 	"sayso-agent/internal/service"
+	"sayso-agent/internal/service/executor"
+	servicellm "sayso-agent/internal/service/llm"
 )
 
 func main() {
@@ -53,10 +55,10 @@ func main() {
 	slackClient := slack.NewClient(slackCfg)
 
 	// 服务层
-	llmSvc := service.NewLLMService(llmClient)
-	folderMatcher := service.NewFolderMatcher(llmSvc)
-	executor := service.NewExecutor(feishuClient, slackClient, feishuCfg, slackCfg, folderMatcher)
-	asrSvc := service.NewASRService(llmSvc, executor)
+	llmSvc := servicellm.NewService(llmClient)
+	folderMatcher := servicellm.NewFolderMatcher(llmClient)
+	exec := executor.NewExecutor(feishuClient, slackClient, feishuCfg, slackCfg, folderMatcher)
+	asrSvc := service.NewASRService(llmSvc, exec)
 
 	// 路由
 	r := handler.Router(asrSvc)
