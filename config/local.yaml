@@ -1,0 +1,25 @@
+# 本地开发环境配置
+server:
+  port: 8080
+  mode: debug
+
+llm:
+  provider: openai
+  api_key: "BxgnSbxrrHOceo4PiLYkyXK7iHZIvXE25NfSqqMn1XDn8Tt6x7A0JQQJ99BKACHYHv6XJ3w3AAAAACOGPem0"  # 建议用环境变量 LLM_API_KEY 覆盖
+  base_url: https://lunalabs-api.openai.azure.com/openai/v1/
+  model: gpt-5.2
+
+feishu:
+  app_id: "cli_a9f284c169f89bdf"
+  app_secret: "GqHEG0Ci3vdhXMrgHmUSEbeVnPmwSDw5"
+  bot_token: ""
+  domain: "qcnygzy1k67v.feishu.cn"  # 飞书域名，如 example.feishu.cn，用于生成文档链接
+  enabled: true
+
+slack:
+  bot_token: ""
+  enabled: false
+
+log:
+  level: debug
+  format: text

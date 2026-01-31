@@ -1,0 +1,25 @@
+# 生产环境配置（敏感信息务必用环境变量覆盖）
+server:
+  port: 8080
+  mode: release
+
+llm:
+  provider: openai
+  api_key: ""
+  base_url: https://api.openai.com/v1
+  model: gpt-4o
+
+feishu:
+  app_id: ""
+  app_secret: ""
+  bot_token: ""
+  domain: ""  # 飞书域名，如 example.feishu.cn
+  enabled: true
+
+slack:
+  bot_token: ""
+  enabled: true
+
+log:
+  level: warn
+  format: json
