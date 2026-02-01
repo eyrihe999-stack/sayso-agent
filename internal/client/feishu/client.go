@@ -487,27 +487,27 @@ func (c *Client) SendIM(ctx context.Context, token, receiveIDType, receiveID, co
 	if linkURL := extractFirstURL(content); linkURL != "" {
 		// 使用 post 富文本，链接可点击
 		contentStr = buildPostContentWithLink(content, linkURL)
-		reqBody := map[string]interface{}{
+		reqBody := map[string]any{
 			"receive_id": receiveID,
 			"msg_type":   "post",
 			"content":    contentStr,
 		}
 		data, _ := json.Marshal(reqBody)
-		return c.sendIMRequest(ctx, token, url+params, receiveID, data)
+		return c.sendIMRequest(ctx, token, url+params, data)
 	}
 	// text 类型，对 content 做 JSON 转义，避免引号/换行导致发送失败或链接被截断
 	textContent, _ := json.Marshal(map[string]string{"text": content})
-	reqBody := map[string]interface{}{
+	reqBody := map[string]any{
 		"receive_id": receiveID,
 		"msg_type":   "text",
 		"content":    string(textContent),
 	}
 	data, _ := json.Marshal(reqBody)
-	return c.sendIMRequest(ctx, token, url+params, receiveID, data)
+	return c.sendIMRequest(ctx, token, url+params, data)
 }
 
 // sendIMRequest 发送飞书消息请求（公共逻辑）
-func (c *Client) sendIMRequest(ctx context.Context, token, fullURL, receiveID string, data []byte) error {
+func (c *Client) sendIMRequest(ctx context.Context, token, fullURL string, data []byte) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, fullURL, bytes.NewReader(data))
 	if err != nil {
 		return err
@@ -582,13 +582,142 @@ func buildPostContentWithLink(fullText, linkURL string) string {
 			textAfter = fullText[idx+len(linkURL):]
 		}
 	}
-	paragraph := []interface{}{
+	paragraph := []any{
 		map[string]string{"tag": "text", "text": textBefore},
 		map[string]string{"tag": "a", "text": linkURL, "href": linkURL},
 		map[string]string{"tag": "text", "text": textAfter},
 	}
-	zhCN := map[string]interface{}{"content": [][]interface{}{paragraph}}
-	root := map[string]interface{}{"zh_cn": zhCN}
+	zhCN := map[string]any{"content": [][]any{paragraph}}
+	root := map[string]any{"zh_cn": zhCN}
 	b, _ := json.Marshal(root)
+	return string(b)
+}
+
+// SendMessageRequest 统一发送消息请求参数
+type SendMessageRequest struct {
+	ReceiveID     string // 接收者 ID
+	ReceiveIDType string // open_id | user_id | chat_id
+	MsgType       string // text | post | interactive
+	Content       string // JSON 格式的消息内容
+}
+
+// SendMessageResult 发送消息结果
+type SendMessageResult struct {
+	MessageID string
+	Error     error
+}
+
+// SendMessage 发送消息（统一入口，支持私聊和群聊）
+func (c *Client) SendMessage(ctx context.Context, token string, req SendMessageRequest) SendMessageResult {
+	url := feishuAPIBase + "/im/v1/messages?receive_id_type=" + req.ReceiveIDType
+	reqBody := map[string]any{
+		"receive_id": req.ReceiveID,
+		"msg_type":   req.MsgType,
+		"content":    req.Content,
+	}
+	data, _ := json.Marshal(reqBody)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
+	if err != nil {
+		return SendMessageResult{Error: err}
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+token)
+	resp, err := c.client.Do(httpReq)
+	if err != nil {
+		return SendMessageResult{Error: err}
+	}
+	b, err := c.checkHTTPStatus(resp, "feishu send message")
+	if err != nil {
+		return SendMessageResult{Error: err}
+	}
+	var result sendMessageResp
+	if err := json.Unmarshal(b, &result); err != nil {
+		return SendMessageResult{Error: fmt.Errorf("feishu send message parse response: %w, body: %s", err, string(b))}
+	}
+	if result.Code != 0 {
+		return SendMessageResult{Error: fmt.Errorf("feishu send message: code=%d msg=%s body=%s", result.Code, result.Msg, string(b))}
+	}
+	msgID := ""
+	if result.Data != nil {
+		msgID = result.Data.MessageID
+	}
+	return SendMessageResult{MessageID: msgID}
+}
+
+// BuildTextContent 构建纯文本消息内容
+func BuildTextContent(text string) string {
+	content, _ := json.Marshal(map[string]string{"text": text})
+	return string(content)
+}
+
+// BuildPostContent 构建富文本消息内容（带可点击链接）
+func BuildPostContent(title, text, linkURL string) string {
+	var paragraph []any
+	if text != "" {
+		paragraph = append(paragraph, map[string]string{"tag": "text", "text": text})
+	}
+	if linkURL != "" {
+		paragraph = append(paragraph, map[string]string{"tag": "a", "text": linkURL, "href": linkURL})
+	}
+	post := map[string]any{
+		"zh_cn": map[string]any{
+			"title":   title,
+			"content": [][]any{paragraph},
+		},
+	}
+	b, _ := json.Marshal(post)
+	return string(b)
+}
+
+// BuildInteractiveCard 构建交互式卡片消息内容（链接卡片）
+func BuildInteractiveCard(title, text, linkURL, description string) string {
+	elements := []any{}
+	if text != "" {
+		elements = append(elements, map[string]any{
+			"tag": "div",
+			"text": map[string]any{
+				"tag":     "plain_text",
+				"content": text,
+			},
+		})
+	}
+	if description != "" {
+		elements = append(elements, map[string]any{
+			"tag": "div",
+			"text": map[string]any{
+				"tag":     "plain_text",
+				"content": description,
+			},
+		})
+	}
+	if linkURL != "" {
+		elements = append(elements, map[string]any{
+			"tag": "action",
+			"actions": []any{
+				map[string]any{
+					"tag": "button",
+					"text": map[string]any{
+						"tag":     "plain_text",
+						"content": "查看链接",
+					},
+					"type": "primary",
+					"url":  linkURL,
+				},
+			},
+		})
+	}
+	card := map[string]any{
+		"config": map[string]any{
+			"wide_screen_mode": true,
+		},
+		"header": map[string]any{
+			"title": map[string]any{
+				"tag":     "plain_text",
+				"content": title,
+			},
+		},
+		"elements": elements,
+	}
+	b, _ := json.Marshal(card)
 	return string(b)
 }

@@ -26,14 +26,21 @@ func NewExecutor(feishuClient *feishu.Client, slackClient *slack.Client, feishuC
 // Execute 执行单条动作，按 type 路由到对应 app 执行器
 func (e *Executor) Execute(ctx context.Context, spec model.ActionSpec, req *model.ASRRequest) (model.ActionSummary, error) {
 	switch spec.Type {
-	case "feishu_create_doc":
+	case model.ActionTypeCreateDoc:
 		return e.feishu.ExecuteCreateDoc(ctx, spec, req)
-	case "feishu_create_folder":
+	case model.ActionTypeCreateFolder:
 		return e.feishu.ExecuteCreateFolder(ctx, spec, req)
-	case "feishu_send_im":
-		return e.feishu.ExecuteSendIM(ctx, spec, req)
-	case "slack_send_message":
-		return e.slack.ExecuteSendMessage(ctx, spec, req)
+	case model.ActionTypeSendMessage:
+		// 统一消息发送，根据 platform 路由
+		platform, _ := spec.Params["platform"].(string)
+		switch platform {
+		case "feishu":
+			return e.feishu.ExecuteSendMessage(ctx, spec, req)
+		case "slack":
+			return e.slack.ExecuteSendMessage(ctx, spec, req)
+		default:
+			return model.ActionSummary{}, fmt.Errorf("send_message: unsupported platform: %s", platform)
+		}
 	default:
 		return model.ActionSummary{}, fmt.Errorf("%w: %s", model.ErrActionNotSupport, spec.Type)
 	}

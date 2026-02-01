@@ -39,8 +39,8 @@ func (s *ASRService) Process(ctx context.Context, req model.ASRRequest) (model.A
 		Success: false,
 	}
 
-	// 1. 大模型理解文本，得到结构化动作
-	llmOut, err := s.llm.Process(ctx, req.Text, req.UserID, req.Contacts)
+	// 1. 大模型理解文本，从自然语言中提取平台、目标、消息内容等
+	llmOut, err := s.llm.Process(ctx, req.Text)
 	if err != nil {
 		resp.Message = fmt.Sprintf("大模型处理失败: %v", err)
 		return resp, err
@@ -78,16 +78,42 @@ func applyPlaceholders(spec model.ActionSpec, placeholders map[string]string) mo
 	}
 	out := spec
 	if spec.Params != nil {
-		out.Params = make(map[string]interface{})
-		for k, v := range spec.Params {
-			if s, ok := v.(string); ok {
-				out.Params[k] = replacePlaceholdersInString(s, placeholders)
-			} else {
-				out.Params[k] = v
-			}
-		}
+		out.Params = replacePlaceholdersInMap(spec.Params, placeholders)
 	}
 	return out
+}
+
+// replacePlaceholdersInMap 递归替换 map 中所有字符串值的占位符
+func replacePlaceholdersInMap(m map[string]any, placeholders map[string]string) map[string]any {
+	result := make(map[string]any)
+	for k, v := range m {
+		result[k] = replacePlaceholdersInValue(v, placeholders)
+	}
+	return result
+}
+
+// replacePlaceholdersInValue 递归替换任意值中的占位符
+func replacePlaceholdersInValue(v any, placeholders map[string]string) any {
+	switch val := v.(type) {
+	case string:
+		return replacePlaceholdersInString(val, placeholders)
+	case map[string]any:
+		return replacePlaceholdersInMap(val, placeholders)
+	case map[string]string:
+		result := make(map[string]any)
+		for k, s := range val {
+			result[k] = replacePlaceholdersInString(s, placeholders)
+		}
+		return result
+	case []any:
+		result := make([]any, len(val))
+		for i, item := range val {
+			result[i] = replacePlaceholdersInValue(item, placeholders)
+		}
+		return result
+	default:
+		return v
+	}
 }
 
 func replacePlaceholdersInString(s string, placeholders map[string]string) string {

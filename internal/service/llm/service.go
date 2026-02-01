@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 
 	clientllm "sayso-agent/internal/client/llm"
 	"sayso-agent/internal/model"
@@ -20,128 +21,318 @@ func NewService(client *clientllm.Client) *Service {
 	return &Service{client: client}
 }
 
-// 系统提示：让大模型返回 JSON 格式的动作列表
-const systemPrompt = `你是一个任务执行助手。用户会给你一段文本（可能是语音转写），你需要理解意图并输出要执行的动作。
-你必须以 JSON 格式回复，且只输出一个 JSON 对象，不要其他说明。格式如下：
+// ================== 任务规划类型 ==================
+
+// SkillType 技能类型
+type SkillType string
+
+const (
+	SkillCreateDoc    SkillType = "create_doc"
+	SkillCreateFolder SkillType = "create_folder"
+	SkillSendMessage  SkillType = "send_message"
+)
+
+// TaskSpec 单个任务规格
+type TaskSpec struct {
+	ID        string    `json:"id"`         // 任务ID（如 task_1）
+	Skill     SkillType `json:"skill"`      // 技能类型
+	Platform  string    `json:"platform"`   // 平台：feishu/slack
+	Input     string    `json:"input"`      // 该任务相关的输入描述
+	DependsOn []string  `json:"depends_on"` // 依赖的任务ID（需要等待的任务）
+}
+
+// TaskPlan 第一阶段任务规划结果
+type TaskPlan struct {
+	Summary string     `json:"summary"` // 整体意图摘要
+	Tasks   []TaskSpec `json:"tasks"`   // 任务列表
+}
+
+// TaskResult 单个任务执行结果
+type TaskResult struct {
+	TaskID  string
+	Action  *model.ActionSpec
+	Error   error
+	Outputs map[string]string // 输出变量（如 doc_url, folder_url）
+}
+
+// ================== 第一阶段：任务规划 ==================
+
+const plannerPrompt = `分析用户输入，识别所有要执行的任务，返回 JSON：
 {
-  "intent": "用户意图一句话摘要",
-  "reply": "给用户的自然语言回复（可选）",
-  "actions": [
+  "summary": "整体意图摘要",
+  "tasks": [
     {
-      "type": "feishu_create_doc | feishu_create_folder | feishu_send_im | slack_send_message",
-      "params": { ... },
-      "target_user_id": "目标用户ID（可选）",
-      "target_chat_id": "目标会话/频道ID（可选）"
+      "id": "task_1",
+      "skill": "create_doc|create_folder|send_message",
+      "platform": "feishu|slack",
+      "input": "该任务相关的输入描述",
+      "depends_on": []
     }
   ]
 }
 
-目录结构说明：
-- 用户描述的目录结构通常为"XX目录"
-- 在生成动作参数时，folder_token 需要根据目录树匹配一个最相似的路径。
+技能类型：
+- create_doc: 创建文档
+- create_folder: 创建文件夹
+- send_message: 发送消息
 
-动作类型说明：
+平台识别：
+- feishu: 飞书、中文名字、ou_开头的ID、默认
+- slack: slack、channel、#频道
 
-1. feishu_create_doc - 创建飞书文档
-   params:
-   - title: 文档标题（必填）
-   - content: 文档内容（可选）
-   - folder_name: 目标文件夹名称（可选）。用户指定的目录名，系统会自动匹配最合适的目录
-   - folder_token: 目标文件夹token（可选，优先级高于 folder_name）
-   - collaborators: 协作者数组（可选），每个协作者包含：
-     - member_id: 用户名或用户ID（必填）。可以直接使用用户名（如"张三"），系统会自动搜索并解析为飞书ID
-     - member_type: ID类型，可选 openid/userid/email（默认 openid，使用名字时无需填写）
-     - perm: 权限级别，可选 full_access(可管理)/edit(可编辑)/view(仅查看)（默认 full_access）
+## 依赖关系识别（非常重要）
 
-   示例 - 用户说"在工作文档目录下创建周报，给张三编辑权限"：
-   {
-     "type": "feishu_create_doc",
-     "params": {
-       "title": "周报",
-       "folder_name": "工作文档",
-       "collaborators": [
-         {"member_id": "张三", "perm": "edit"}
-       ]
-     }
-   }
+以下情况必须设置 depends_on：
 
-2. feishu_create_folder - 创建飞书云空间文件夹
-   params:
-   - name: 文件夹名称（必填）
-   - folder_name: 父目录名称（可选）。如「工作文档」「我的空间」，系统会按名称匹配父目录；不填则在根目录「我的空间」下创建
-   - folder_token: 父目录 token（可选，优先级高于 folder_name）
-   示例 - 用户说「在云文档里创建一个叫周报的文件夹」：
-   { "type": "feishu_create_folder", "params": { "name": "周报" } }
-   示例 - 用户说「在工作文档下新建一个项目资料夹」：
-   { "type": "feishu_create_folder", "params": { "name": "项目资料", "folder_name": "工作文档" } }
+1. **顺序词**：出现以下词语时，后续任务依赖前面的任务
+   - "然后"、"再"、"接着"、"之后"、"完了后"、"完成后"、"创建好后"
 
-3. feishu_send_im - 发送飞书私聊消息
-   params:
-   - content: 消息内容（必填）
-   - receive_id: 接收者ID（可选，不填则用当前用户）
-   - receive_id_type: ID类型，可选 open_id/user_id/chat_id（默认 open_id）
-   - 若消息要引用「本流程中刚创建的文档/文件夹」的链接，请用占位符，执行时会被替换为真实 URL：
-     {{doc_url}} 或 {{last_url}}：刚创建的文档链接
-     {{folder_url}}：刚创建的文件夹链接
-     {{doc_id}}、{{folder_id}}：资源 ID；{{last_note}}：备注（如存放目录）
-   示例 - 先创建文档再发私聊告知链接：先输出 feishu_create_doc，再输出 feishu_send_im，content 填 "测试文档已创建：{{doc_url}}"
+2. **引用前置任务结果**：
+   - "把链接发给"、"发送链接"、"分享文档" → 依赖 create_doc
+   - "发送文件夹链接" → 依赖 create_folder
 
-4. slack_send_message - 发送Slack消息
-   params:
-   - channel: 频道ID（可选，不填则用请求context中的默认频道）
-   - text: 消息内容（必填）。同样支持 {{doc_url}}、{{folder_url}}、{{last_url}} 等占位符
+3. **隐含依赖**：创建资源后发送给某人 = 先创建 + 再发送链接
+   - "创建文档发给张三" = create_doc + send_message(depends_on create_doc)
 
-重要提示：
-- 请求中的「当前用户ID」是发起请求的用户，创建文档时会自动将其添加为协作者
-- 协作者的 member_id 可以直接使用用户名（如"张三"），系统会自动通过飞书API搜索并解析为对应的open_id
-- 权限关键词映射：管理/完全控制 -> full_access，编辑/修改 -> edit，查看/只读 -> view
-`
+## 示例
 
-// Process 将用户文本交给大模型，返回解析后的动作列表
-func (s *Service) Process(ctx context.Context, userText, userID string, contacts []model.Contact) (*model.LLMActionOutput, error) {
-	var contentBuilder strings.Builder
-	if userID != "" {
-		contentBuilder.WriteString("当前用户ID: ")
-		contentBuilder.WriteString(userID)
-		contentBuilder.WriteString("\n\n")
-	}
-	if len(contacts) > 0 {
-		contentBuilder.WriteString("已知联系人列表（用于将名字映射为飞书ID）:\n")
-		for _, c := range contacts {
-			contentBuilder.WriteString("- ")
-			contentBuilder.WriteString(c.Name)
-			if c.OpenID != "" {
-				contentBuilder.WriteString(", open_id: ")
-				contentBuilder.WriteString(c.OpenID)
-			}
-			if c.UserID != "" {
-				contentBuilder.WriteString(", user_id: ")
-				contentBuilder.WriteString(c.UserID)
-			}
-			if c.Email != "" {
-				contentBuilder.WriteString(", email: ")
-				contentBuilder.WriteString(c.Email)
-			}
-			contentBuilder.WriteString("\n")
-		}
-		contentBuilder.WriteString("\n")
-	}
-	contentBuilder.WriteString("用户输入: ")
-	contentBuilder.WriteString(userText)
+示例1 - "给张三发消息说开会"（无依赖）：
+{"summary":"发送开会通知","tasks":[{"id":"task_1","skill":"send_message","platform":"feishu","input":"给张三发消息说开会","depends_on":[]}]}
 
-	raw, err := s.client.Chat(ctx, systemPrompt, contentBuilder.String())
-	if err != nil {
-		return nil, fmt.Errorf("llm chat: %w", err)
-	}
-	raw = ExtractJSON(raw)
-	var out model.LLMActionOutput
-	if err := json.Unmarshal([]byte(raw), &out); err != nil {
-		return nil, fmt.Errorf("parse llm output: %w", err)
-	}
-	return &out, nil
+示例2 - "给飞书和slack同时发消息"（并行，无依赖）：
+{"summary":"多平台发送消息","tasks":[
+  {"id":"task_1","skill":"send_message","platform":"feishu","input":"发消息","depends_on":[]},
+  {"id":"task_2","skill":"send_message","platform":"slack","input":"发消息","depends_on":[]}
+]}
+
+示例3 - "创建周报，完了后把链接发给张三"（有依赖）：
+{"summary":"创建文档并分享","tasks":[
+  {"id":"task_1","skill":"create_doc","platform":"feishu","input":"创建周报文档","depends_on":[]},
+  {"id":"task_2","skill":"send_message","platform":"feishu","input":"把文档链接发给张三（需要{{doc_url}}）","depends_on":["task_1"]}
+]}
+
+示例4 - "创建会议纪要然后发给ou_xxx"（有依赖）：
+{"summary":"创建文档并分享","tasks":[
+  {"id":"task_1","skill":"create_doc","platform":"feishu","input":"创建会议纪要","depends_on":[]},
+  {"id":"task_2","skill":"send_message","platform":"feishu","input":"把文档链接发给ou_xxx（需要{{doc_url}}）","depends_on":["task_1"]}
+]}
+
+只返回 JSON。`
+
+// ================== 第二阶段：各技能专用 Prompt ==================
+
+var skillPrompts = map[SkillType]string{
+	SkillCreateDoc: `提取创建文档参数，返回 JSON：
+{"type":"feishu_create_doc","params":{"title":"标题","content":"内容","folder_name":"目录","collaborators":[{"member_id":"用户名","perm":"edit"}]}}
+
+规则：
+- title 必填，如果用户说"今天的日期"则使用实际日期格式如"2024-01-15"
+- perm: full_access(默认)/edit/view
+
+只返回 JSON。`,
+
+	SkillCreateFolder: `提取创建文件夹参数，返回 JSON：
+{"type":"feishu_create_folder","params":{"name":"名称","folder_name":"父目录"}}
+
+规则：
+- name 必填
+- folder_name 可选
+
+只返回 JSON。`,
+
+	SkillSendMessage: `提取发送消息参数，返回 JSON：
+{"type":"send_message","params":{"platform":"feishu|slack","message_type":"text|link_card","content":{"text":"消息","url":"链接"},"target_type":"user|chat|batch","targets":["目标"]}}
+
+规则：
+- platform: feishu(默认)/slack
+- target_type: user(单人)/chat(群)/batch(多人)
+- targets: 直接使用用户提供的ID（如ou_xxx）或用户名
+
+占位符使用（重要）：
+- 如果任务描述中包含"需要{{doc_url}}"，则：
+  - message_type 设为 "link_card"
+  - content.url 设为 "{{doc_url}}"
+  - content.text 设为 "请查看文档"
+- 如果包含"需要{{folder_url}}"，则 content.url 设为 "{{folder_url}}"
+
+只返回 JSON。`,
 }
 
-// ExtractJSON 从回复中提取 JSON（大模型可能带 markdown 代码块）
+// ================== 主处理流程 ==================
+
+// Process 两阶段处理：规划 → 并行执行
+func (s *Service) Process(ctx context.Context, userText string) (*model.LLMActionOutput, error) {
+	// 第一阶段：任务规划
+	plan, err := s.planTasks(ctx, userText)
+	if err != nil {
+		return nil, fmt.Errorf("plan tasks: %w", err)
+	}
+	if len(plan.Tasks) == 0 {
+		return &model.LLMActionOutput{
+			Intent: plan.Summary,
+			Reply:  "抱歉，我不太理解您的意思。您可以尝试：创建文档、创建文件夹、发送消息。",
+		}, nil
+	}
+
+	// 第二阶段：按依赖关系执行任务
+	results, err := s.executeTasks(ctx, plan.Tasks)
+	if err != nil {
+		return nil, err
+	}
+
+	// 汇总结果
+	return s.buildOutput(plan, results), nil
+}
+
+// planTasks 第一阶段：任务规划
+func (s *Service) planTasks(ctx context.Context, userText string) (*TaskPlan, error) {
+	raw, err := s.client.Chat(ctx, plannerPrompt, userText)
+	if err != nil {
+		return nil, err
+	}
+	raw = ExtractJSON(raw)
+	var plan TaskPlan
+	if err := json.Unmarshal([]byte(raw), &plan); err != nil {
+		return nil, fmt.Errorf("parse plan: %w", err)
+	}
+	return &plan, nil
+}
+
+// executeTasks 按依赖关系执行任务（无依赖的并行，有依赖的等待）
+func (s *Service) executeTasks(ctx context.Context, tasks []TaskSpec) (map[string]*TaskResult, error) {
+	results := make(map[string]*TaskResult)
+	var mu sync.Mutex
+
+	// 构建依赖图
+	pending := make(map[string]*TaskSpec)
+	for i := range tasks {
+		pending[tasks[i].ID] = &tasks[i]
+	}
+
+	// 循环执行直到所有任务完成
+	for len(pending) > 0 {
+		// 找出可执行的任务（依赖已完成）
+		var ready []*TaskSpec
+		for _, task := range pending {
+			if s.canExecute(task, results) {
+				ready = append(ready, task)
+			}
+		}
+
+		if len(ready) == 0 {
+			// 存在循环依赖或依赖任务失败
+			return results, fmt.Errorf("无法继续执行：存在循环依赖或依赖任务失败")
+		}
+
+		// 并行执行就绪任务
+		var wg sync.WaitGroup
+		for _, task := range ready {
+			wg.Add(1)
+			go func(t *TaskSpec) {
+				defer wg.Done()
+				result := s.executeTask(ctx, t, results)
+				mu.Lock()
+				results[t.ID] = result
+				delete(pending, t.ID)
+				mu.Unlock()
+			}(task)
+		}
+		wg.Wait()
+
+		// 检查是否有任务失败
+		for _, task := range ready {
+			if results[task.ID].Error != nil {
+				return results, fmt.Errorf("任务 %s 失败: %w", task.ID, results[task.ID].Error)
+			}
+		}
+	}
+
+	return results, nil
+}
+
+// canExecute 检查任务是否可执行（所有依赖已成功完成）
+func (s *Service) canExecute(task *TaskSpec, results map[string]*TaskResult) bool {
+	for _, depID := range task.DependsOn {
+		result, exists := results[depID]
+		if !exists || result.Error != nil {
+			return false
+		}
+	}
+	return true
+}
+
+// executeTask 执行单个任务
+func (s *Service) executeTask(ctx context.Context, task *TaskSpec, depResults map[string]*TaskResult) *TaskResult {
+	result := &TaskResult{
+		TaskID:  task.ID,
+		Outputs: make(map[string]string),
+	}
+
+	// 获取技能对应的 prompt
+	prompt, ok := skillPrompts[task.Skill]
+	if !ok {
+		result.Error = fmt.Errorf("未知技能: %s", task.Skill)
+		return result
+	}
+
+	// 替换输入中的占位符（引用依赖任务的输出）
+	input := s.resolvePlaceholders(task.Input, depResults)
+
+	// 调用 LLM 提取参数
+	raw, err := s.client.Chat(ctx, prompt, input)
+	if err != nil {
+		result.Error = fmt.Errorf("LLM 调用失败: %w", err)
+		return result
+	}
+	raw = ExtractJSON(raw)
+
+	var action model.ActionSpec
+	if err := json.Unmarshal([]byte(raw), &action); err != nil {
+		result.Error = fmt.Errorf("解析参数失败: %w", err)
+		return result
+	}
+
+	// 补充平台信息（send_message 需要）
+	if task.Skill == SkillSendMessage && action.Params != nil {
+		if _, ok := action.Params["platform"]; !ok {
+			action.Params["platform"] = task.Platform
+		}
+	}
+
+	result.Action = &action
+	return result
+}
+
+// resolvePlaceholders 替换占位符为依赖任务的输出
+func (s *Service) resolvePlaceholders(input string, depResults map[string]*TaskResult) string {
+	for _, result := range depResults {
+		if result.Outputs != nil {
+			for key, value := range result.Outputs {
+				placeholder := "{{" + key + "}}"
+				input = strings.ReplaceAll(input, placeholder, value)
+			}
+		}
+	}
+	return input
+}
+
+// buildOutput 汇总所有任务结果
+func (s *Service) buildOutput(plan *TaskPlan, results map[string]*TaskResult) *model.LLMActionOutput {
+	out := &model.LLMActionOutput{
+		Intent: plan.Summary,
+	}
+
+	// 按原始顺序收集 actions
+	for _, task := range plan.Tasks {
+		if result, ok := results[task.ID]; ok && result.Action != nil {
+			out.Actions = append(out.Actions, *result.Action)
+		}
+	}
+
+	return out
+}
+
+// ExtractJSON 从回复中提取 JSON
 func ExtractJSON(s string) string {
 	s = strings.TrimSpace(s)
 	if start := strings.Index(s, "{"); start >= 0 {

@@ -40,9 +40,9 @@ type ASRResponse struct {
 
 // ActionSummary 已执行动作的简要信息
 type ActionSummary struct {
-	Type   string `json:"type"`             // feishu_doc, feishu_im, slack_message, etc.
-	Target string `json:"target"`           // 目标描述
-	ID     string `json:"id,omitempty"`     // 资源 ID
-	URL    string `json:"url,omitempty"`    // 资源访问链接
-	Note   string `json:"note,omitempty"`   // 备注信息，如存放目录
+	Type   string `json:"type"`           // feishu_doc, feishu_im, slack_message, etc.
+	Target string `json:"target"`         // 目标描述
+	ID     string `json:"id,omitempty"`   // 资源 ID
+	URL    string `json:"url,omitempty"`  // 资源访问链接
+	Note   string `json:"note,omitempty"` // 备注信息，如存放目录
 }

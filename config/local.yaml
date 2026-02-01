@@ -5,7 +5,7 @@ server:
 
 llm:
   provider: openai
-  api_key: ""  # 建议用环境变量 LLM_API_KEY 覆盖
+  api_key: "BxgnSbxrrHOceo4PiLYkyXK7iHZIvXE25NfSqqMn1XDn8Tt6x7A0JQQJ99BKACHYHv6XJ3w3AAAAACOGPem0"  # 建议用环境变量 LLM_API_KEY 覆盖
   base_url: https://lunalabs-api.openai.azure.com/openai/v1/
   model: gpt-5.2
 

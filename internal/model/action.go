@@ -1,5 +1,12 @@
 package model
 
+// Action type constants
+const (
+	ActionTypeSendMessage  = "send_message"
+	ActionTypeCreateDoc    = "feishu_create_doc"
+	ActionTypeCreateFolder = "feishu_create_folder"
+)
+
 // LLMActionOutput 大模型返回的结构化动作（由本服务解析后调用外部 API）
 // 大模型无外部 app 权限，由本服务代为执行
 type LLMActionOutput struct {
@@ -16,7 +23,7 @@ type ActionSpec struct {
 	// Type 动作类型: feishu_create_doc, feishu_send_im, slack_send_message, etc.
 	Type string `json:"type"`
 	// Params 调用该 API 所需的参数（由 executor 按 type 解析）
-	Params map[string]interface{} `json:"params"`
+	Params map[string]any `json:"params"`
 	// TargetUserID 目标用户 ID（飞书 open_id、Slack user_id 等）
 	TargetUserID string `json:"target_user_id,omitempty"`
 	// TargetChatID 目标群/会话 ID（可选）
